@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chess Signaling Server</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        .status { padding: 10px; background: #f0f0f0; margin: 10px 0; }
+        .connected { background: #d4edda; }
+        .error { background: #f8d7da; }
+    </style>
+</head>
+<body>
+    <h1>Chess Signaling Server</h1>
+    <div id="status" class="status">Server is running...</div>
+    
+    <h2>Test Room Creation</h2>
+    <button onclick="createRoom()">Create Test Room</button>
+    <div id="roomInfo"></div>
+
+    <script>
+        async function createRoom() {
+            try {
+                const response = await fetch('/api/create-room', { method: 'POST' });
+                const data = await response.json();
+                
+                if (data.success) {
+                    document.getElementById('roomInfo').innerHTML = 
+                        `<p>Room created: <strong>${data.roomId}</strong></p>
+                         <p>Test URL: <a href="/api/room/${data.roomId}" target="_blank">/api/room/${data.roomId}</a></p>`;
+                }
+            } catch (error) {
+                console.error('Error creating room:', error);
+            }
+        }
+        
+        // Test server connection
+        fetch('/api/create-room', { method: 'POST' })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('status').className = 'status connected';
+                document.getElementById('status').innerHTML = 'Server is running and responsive!';
+            })
+            .catch(error => {
+                document.getElementById('status').className = 'status error';
+                document.getElementById('status').innerHTML = 'Server error: ' + error.message;
+            });
+    </script>
+</body>
+</html>
