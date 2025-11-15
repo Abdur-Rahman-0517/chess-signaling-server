@@ -1,4 +1,3 @@
-// server.js
 const WebSocket = require('ws');
 const express = require('express');
 const http = require('http');
@@ -15,36 +14,97 @@ const wss = new WebSocket.Server({ server });
 
 const rooms = new Map();
 const connections = new Map();
+const roomTimeouts = new Map(); // For storing timeout handles
+
+// --- Room Timeout Logic ---
+
+const TIMEOUTS = {
+    EMPTY: 5 * 60 * 1000,     // 5 minutes
+    ONE_PLAYER: 2 * 60 * 60 * 1000, // 2 hours
+    TWO_PLAYERS: 5 * 60 * 60 * 1000 // 5 hours
+};
+
+function clearRoomTimeout(roomId) {
+    if (roomTimeouts.has(roomId)) {
+        clearTimeout(roomTimeouts.get(roomId));
+        roomTimeouts.delete(roomId);
+    }
+}
+
+function closeRoom(roomId) {
+    console.log(`Closing room ${roomId} due to timeout.`);
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    if (room.host && room.host.ws.readyState === WebSocket.OPEN) {
+        room.host.ws.close(1000, 'Room timed out');
+    }
+    if (room.guest && room.guest.ws.readyState === WebSocket.OPEN) {
+        room.guest.ws.close(1000, 'Room timed out');
+    }
+    
+    rooms.delete(roomId);
+    roomTimeouts.delete(roomId); // Clean up the handle just in case
+}
+
+function updateRoomTimeout(roomId) {
+    clearRoomTimeout(roomId); // Clear existing timeout
+
+    const room = rooms.get(roomId);
+    if (!room) return; // Room is already deleted
+
+    const hostOnline = room.host && room.host.ws.readyState === WebSocket.OPEN;
+    const guestOnline = room.guest && room.guest.ws.readyState === WebSocket.OPEN;
+
+    let timeoutDuration;
+    let playerCount = 0;
+
+    if (hostOnline) playerCount++;
+    if (guestOnline) playerCount++;
+
+    if (playerCount === 0) {
+        timeoutDuration = TIMEOUTS.EMPTY;
+        console.log(`Room ${roomId}: 0 players. Setting ${TIMEOUTS.EMPTY / 60000} min timeout.`);
+    } else if (playerCount === 1) {
+        timeoutDuration = TIMEOUTS.ONE_PLAYER;
+        console.log(`Room ${roomId}: 1 player. Setting ${TIMEOUTS.ONE_PLAYER / 3600000} hr timeout.`);
+    } else { // playerCount === 2
+        timeoutDuration = TIMEOUTS.TWO_PLAYERS;
+        console.log(`Room ${roomId}: 2 players. Setting ${TIMEOUTS.TWO_PLAYERS / 3600000} hr timeout.`);
+    }
+
+    const timeoutHandle = setTimeout(() => {
+        closeRoom(roomId);
+    }, timeoutDuration);
+
+    roomTimeouts.set(roomId, timeoutHandle);
+}
+
+// --- End Room Timeout Logic ---
+
 
 // Serve a simple test page
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// REST endpoint to create a room
-app.post('/api/create-room', (req, res) => {
-    const roomId = generateRoomId();
-    rooms.set(roomId, { 
-        host: null, 
-        guest: null, 
-        createdAt: Date.now(),
-        lastActivity: Date.now()
-    });
-    console.log(`Room created: ${roomId}`);
-    res.json({ roomId, success: true });
-});
-
-// REST endpoint to check room status
+// REST endpoint to check room status (for joining)
 app.get('/api/room/:roomId', (req, res) => {
     const roomId = req.params.roomId;
     const room = rooms.get(roomId);
-    if (!room) return res.status(404).json({ error: 'Room not found' });
+    
+    if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+    }
+    
+    const hostConnected = !!room.host && room.host.ws.readyState === WebSocket.OPEN;
+    const guestConnected = !!room.guest && room.guest.ws.readyState === WebSocket.OPEN;
 
     res.json({
         roomId,
-        hostConnected: !!room.host,
-        guestConnected: !!room.guest,
-        playerCount: (room.host ? 1 : 0) + (room.guest ? 1 : 0)
+        hostConnected: hostConnected,
+        guestConnected: guestConnected,
+        playerCount: (hostConnected ? 1 : 0) + (guestConnected ? 1 : 0)
     });
 });
 
@@ -55,28 +115,32 @@ wss.on('connection', (ws, request) => {
     const playerId = url.searchParams.get('player');
     const isHost = url.searchParams.get('host') === 'true';
 
+    console.log(`New connection: room=${roomId}, player=${playerId}, isHost=${isHost}`);
+
     if (!roomId || !playerId) {
         ws.close(1008, 'Missing room or player ID');
         return;
     }
 
+    // Initialize room if it doesn't exist
     if (!rooms.has(roomId)) {
-        rooms.set(roomId, { 
-            host: null, 
-            guest: null, 
-            createdAt: Date.now(),
-            lastActivity: Date.now()
-        });
+        if (isHost) {
+            rooms.set(roomId, { host: null, guest: null, createdAt: Date.now() });
+        } else {
+            // Guest trying to join a non-existent room
+            ws.send(JSON.stringify({ type: 'error', message: 'Room not found' }));
+            ws.close(1008, 'Room not found');
+            return;
+        }
     }
 
     const room = rooms.get(roomId);
-    room.lastActivity = Date.now(); // Update activity on connection
-    
     const connectionId = `${roomId}-${playerId}`;
     connections.set(connectionId, ws);
 
     if (isHost) {
         if (room.host && room.host.ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Room already has a host' }));
             ws.close(1008, 'Room already has a host');
             return;
         }
@@ -84,109 +148,91 @@ wss.on('connection', (ws, request) => {
         console.log(`Host ${playerId} joined room ${roomId}`);
     } else {
         if (room.guest && room.guest.ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
             ws.close(1008, 'Room already has a guest');
             return;
         }
         room.guest = { ws, playerId };
         console.log(`Guest ${playerId} joined room ${roomId}`);
+        
+        // Notify host that guest joined
         if (room.host && room.host.ws.readyState === WebSocket.OPEN) {
-            room.host.ws.send(JSON.stringify({ type: 'player-joined', playerId }));
+            room.host.ws.send(JSON.stringify({ 
+                type: 'player-joined',
+                playerId: playerId
+            }));
+            console.log(`Notified host of room ${roomId} that guest joined`);
         }
     }
 
+    // Update timeout on new connection
+    updateRoomTimeout(roomId);
+
     ws.on('message', (message) => {
         try {
-            room.lastActivity = Date.now(); // Update activity on message
-            
             const data = JSON.parse(message);
+            console.log(`Message from ${playerId} in room ${roomId}: ${data.type}`);
+            
+            // Route message to the other player
             const target = isHost ? room.guest : room.host;
             if (target && target.ws.readyState === WebSocket.OPEN) {
-                target.ws.send(message);
+                target.ws.send(message); // Relay the exact message
+                console.log(`Message relayed to ${target.playerId}`);
             } else {
-                ws.send(JSON.stringify({ type: 'error', message: 'Other player is not connected' }));
+                console.log(`Target player not found or not connected in room ${roomId}`);
+                // Don't notify on move, only on error
+                if (data.type !== 'move') {
+                    ws.send(JSON.stringify({
+                        type: 'error',
+                        message: 'Other player is not connected'
+                    }));
+                }
             }
         } catch (error) {
             console.error('Error parsing message:', error);
         }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code, reason) => {
+        console.log(`Connection closed for player ${playerId} in room ${roomId}: ${code} - ${reason}`);
+        
         connections.delete(connectionId);
+        
+        // Notify the other player
         if (isHost) {
             room.host = null;
-            if (room.guest?.ws.readyState === WebSocket.OPEN) {
-                room.guest.ws.send(JSON.stringify({ type: 'host-disconnected' }));
+            if (room.guest && room.guest.ws.readyState === WebSocket.OPEN) {
+                room.guest.ws.send(JSON.stringify({ type: 'opponent-disconnected' }));
             }
         } else {
             room.guest = null;
-            if (room.host?.ws.readyState === WebSocket.OPEN) {
-                room.host.ws.send(JSON.stringify({ type: 'guest-disconnected' }));
+            if (room.host && room.host.ws.readyState === WebSocket.OPEN) {
+                room.host.ws.send(JSON.stringify({ type: 'opponent-disconnected' }));
             }
         }
-
-        // Update last activity when someone disconnects
-        room.lastActivity = Date.now();
-
-        // Clean up empty rooms after 8 minutes
-        if (!room.host && !room.guest) {
-            setTimeout(() => {
-                const currentRoom = rooms.get(roomId);
-                if (currentRoom && !currentRoom.host && !currentRoom.guest) {
-                    rooms.delete(roomId);
-                    console.log(`Empty room ${roomId} cleaned up after 8 minutes`);
-                }
-            }, 480000); // 8 minutes
-        }
+        
+        // Update timeout on disconnect
+        updateRoomTimeout(roomId);
     });
 
-    ws.on('error', (error) => console.error(`WebSocket error:`, error));
+    ws.on('error', (error) => {
+        console.error(`WebSocket error for player ${playerId} in room ${roomId}:`, error);
+    });
 
-    ws.send(JSON.stringify({ type: 'connected', roomId, playerId, isHost }));
+    // Send connection confirmation
+    ws.send(JSON.stringify({
+        type: 'connected',
+        roomId: roomId,
+        playerId: playerId,
+        isHost: isHost
+    }));
 });
 
-// Room ID generator
-function generateRoomId() {
-    return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
-
-// Clean up old rooms every minute
-setInterval(() => {
-    const now = Date.now();
-    for (const [roomId, room] of rooms.entries()) {
-        const roomAge = now - room.createdAt;
-        const timeSinceLastActivity = now - room.lastActivity;
-        const bothConnected = room.host && room.guest;
-        const oneConnected = (room.host || room.guest) && !(room.host && room.guest);
-
-        if (bothConnected && roomAge > 43200000) { // 12 hours (12 * 60 * 60 * 1000)
-            room.host?.ws.readyState === WebSocket.OPEN && room.host.ws.close(1000, 'Room expired (12 hours with both players)');
-            room.guest?.ws.readyState === WebSocket.OPEN && room.guest.ws.close(1000, 'Room expired (12 hours with both players)');
-            rooms.delete(roomId);
-            console.log(`Room ${roomId} expired after 12 hours with both players connected`);
-        } else if (oneConnected && timeSinceLastActivity > 7200000) { // 2 hours (2 * 60 * 60 * 1000)
-            if (room.host?.ws.readyState === WebSocket.OPEN) {
-                room.host.ws.close(1000, 'Room expired (2 hours with one player)');
-            }
-            if (room.guest?.ws.readyState === WebSocket.OPEN) {
-                room.guest.ws.close(1000, 'Room expired (2 hours with one player)');
-            }
-            rooms.delete(roomId);
-            console.log(`Room ${roomId} expired after 2 hours with only one player connected`);
-        } else if (!room.host && !room.guest && timeSinceLastActivity > 480000) { // 8 minutes (8 * 60 * 1000)
-            rooms.delete(roomId);
-            console.log(`Room ${roomId} expired after 8 minutes with no players connected`);
-        }
-    }
-}, 60000); // Check every minute
-
-// Render-ready port
+// Remove periodic cleanup, timeouts are handled on connect/disconnect
+// const PORT = process.env.PORT || 3000; (already defined in your file)
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Chess signaling server running on port ${PORT}`);
     console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
     console.log(`HTTP endpoint: http://localhost:${PORT}`);
-    console.log('\nRoom expiration rules:');
-    console.log('- Both players connected: 12 hours');
-    console.log('- Only one player connected: 2 hours of inactivity');
-    console.log('- No players connected: 8 minutes');
 });
