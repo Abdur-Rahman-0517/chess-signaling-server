@@ -24,7 +24,12 @@ app.get('/', (req, res) => {
 // REST endpoint to create a room
 app.post('/api/create-room', (req, res) => {
     const roomId = generateRoomId();
-    rooms.set(roomId, { host: null, guest: null, createdAt: Date.now() });
+    rooms.set(roomId, { 
+        host: null, 
+        guest: null, 
+        createdAt: Date.now(),
+        lastActivity: Date.now()
+    });
     console.log(`Room created: ${roomId}`);
     res.json({ roomId, success: true });
 });
@@ -56,10 +61,17 @@ wss.on('connection', (ws, request) => {
     }
 
     if (!rooms.has(roomId)) {
-        rooms.set(roomId, { host: null, guest: null, createdAt: Date.now() });
+        rooms.set(roomId, { 
+            host: null, 
+            guest: null, 
+            createdAt: Date.now(),
+            lastActivity: Date.now()
+        });
     }
 
     const room = rooms.get(roomId);
+    room.lastActivity = Date.now(); // Update activity on connection
+    
     const connectionId = `${roomId}-${playerId}`;
     connections.set(connectionId, ws);
 
@@ -84,6 +96,8 @@ wss.on('connection', (ws, request) => {
 
     ws.on('message', (message) => {
         try {
+            room.lastActivity = Date.now(); // Update activity on message
+            
             const data = JSON.parse(message);
             const target = isHost ? room.guest : room.host;
             if (target && target.ws.readyState === WebSocket.OPEN) {
@@ -110,13 +124,18 @@ wss.on('connection', (ws, request) => {
             }
         }
 
+        // Update last activity when someone disconnects
+        room.lastActivity = Date.now();
+
+        // Clean up empty rooms after 8 minutes
         if (!room.host && !room.guest) {
             setTimeout(() => {
-                if (rooms.get(roomId)?.host === null && rooms.get(roomId)?.guest === null) {
+                const currentRoom = rooms.get(roomId);
+                if (currentRoom && !currentRoom.host && !currentRoom.guest) {
                     rooms.delete(roomId);
-                    console.log(`Room ${roomId} cleaned up`);
+                    console.log(`Empty room ${roomId} cleaned up after 8 minutes`);
                 }
-            }, 3600000); // 1 hour
+            }, 480000); // 8 minutes
         }
     });
 
@@ -130,17 +149,35 @@ function generateRoomId() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// Clean up old rooms every 10 minutes
+// Clean up old rooms every minute
 setInterval(() => {
     const now = Date.now();
     for (const [roomId, room] of rooms.entries()) {
-        if (now - room.createdAt > 7200000) {
-            room.host?.ws.readyState === WebSocket.OPEN && room.host.ws.close(1000, 'Room expired');
-            room.guest?.ws.readyState === WebSocket.OPEN && room.guest.ws.close(1000, 'Room expired');
+        const roomAge = now - room.createdAt;
+        const timeSinceLastActivity = now - room.lastActivity;
+        const bothConnected = room.host && room.guest;
+        const oneConnected = (room.host || room.guest) && !(room.host && room.guest);
+
+        if (bothConnected && roomAge > 43200000) { // 12 hours (12 * 60 * 60 * 1000)
+            room.host?.ws.readyState === WebSocket.OPEN && room.host.ws.close(1000, 'Room expired (12 hours with both players)');
+            room.guest?.ws.readyState === WebSocket.OPEN && room.guest.ws.close(1000, 'Room expired (12 hours with both players)');
             rooms.delete(roomId);
+            console.log(`Room ${roomId} expired after 12 hours with both players connected`);
+        } else if (oneConnected && timeSinceLastActivity > 7200000) { // 2 hours (2 * 60 * 60 * 1000)
+            if (room.host?.ws.readyState === WebSocket.OPEN) {
+                room.host.ws.close(1000, 'Room expired (2 hours with one player)');
+            }
+            if (room.guest?.ws.readyState === WebSocket.OPEN) {
+                room.guest.ws.close(1000, 'Room expired (2 hours with one player)');
+            }
+            rooms.delete(roomId);
+            console.log(`Room ${roomId} expired after 2 hours with only one player connected`);
+        } else if (!room.host && !room.guest && timeSinceLastActivity > 480000) { // 8 minutes (8 * 60 * 1000)
+            rooms.delete(roomId);
+            console.log(`Room ${roomId} expired after 8 minutes with no players connected`);
         }
     }
-}, 600000);
+}, 60000); // Check every minute
 
 // Render-ready port
 const PORT = process.env.PORT || 3000;
@@ -148,4 +185,8 @@ server.listen(PORT, () => {
     console.log(`Chess signaling server running on port ${PORT}`);
     console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
     console.log(`HTTP endpoint: http://localhost:${PORT}`);
+    console.log('\nRoom expiration rules:');
+    console.log('- Both players connected: 12 hours');
+    console.log('- Only one player connected: 2 hours of inactivity');
+    console.log('- No players connected: 8 minutes');
 });
